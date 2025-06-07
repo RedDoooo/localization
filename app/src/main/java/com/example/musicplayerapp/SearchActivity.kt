@@ -8,25 +8,22 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.Parcelable
 import android.util.Log
 import android.view.View
+import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.viewModels // Import for by viewModels()
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import org.jsoup.Jsoup
-import org.jsoup.nodes.Document
-import java.net.URLEncoder
+
 
 class SearchActivity : AppCompatActivity() {
 
@@ -39,8 +36,16 @@ class SearchActivity : AppCompatActivity() {
     private lateinit var searchResultsRecyclerView: RecyclerView
     private lateinit var searchMessageTextView: TextView
     private lateinit var searchResultsAdapter: SearchResultsAdapter
+    private lateinit var layoutManager: LinearLayoutManager
+
 
     private var pendingDownloadItem: SearchResultItem? = null
+    private val viewModel: SearchViewModel by viewModels()
+
+    // For RecyclerView scroll state
+    private var layoutManagerState: Parcelable? = null
+    private val GITHUB_SEARCH_URL_BASE = "https://www.gequbao.com/s/" // Example base URL
+
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -54,107 +59,107 @@ class SearchActivity : AppCompatActivity() {
         searchMessageTextView = findViewById(R.id.searchMessageTextView)
 
         setupRecyclerView()
+        setupObservers()
 
         searchButton.setOnClickListener {
             val query = searchEditText.text.toString().trim()
-            if (query.isNotEmpty()) {
-                performSearchWithUiUpdate(query)
+            viewModel.performSearch(query, getString(R.string.no_results_message), getString(R.string.search_error_message))
+            // Hide keyboard
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+            imm.hideSoftInputFromWindow(searchEditText.windowToken, 0)
+        }
+
+        searchEditText.setOnEditorActionListener { _, actionId, _ ->
+            if (actionId == EditorInfo.IME_ACTION_SEARCH) {
+                searchButton.performClick()
+                true
             } else {
-                searchMessageTextView.text = "Please enter a search query."
-                searchMessageTextView.visibility = View.VISIBLE
-                searchResultsRecyclerView.visibility = View.GONE
-                searchResultsAdapter.clearData()
+                false
             }
         }
+
+        if (savedInstanceState != null) {
+            layoutManagerState = savedInstanceState.getParcelable("LAYOUT_MANAGER_STATE")
+            viewModel.currentQuery = savedInstanceState.getString("CURRENT_QUERY") ?: ""
+            // ViewModel automatically retains LiveData, but we restore query for EditText
+            searchEditText.setText(viewModel.currentQuery)
+            // If there were results, ViewModel will provide them via LiveData.
+            // If a message was showing, ViewModel will provide it.
+        } else {
+            // If it's a fresh start and there's a query (e.g. from a previous non-config-change session),
+            // you might want to trigger search or restore results.
+            // For now, if query is not blank, it means it was likely set by savedInstanceState or user typed before rotation
+            if (viewModel.currentQuery.isNotBlank() && viewModel.searchResults.value.isNullOrEmpty()) {
+                 // This ensures if activity is destroyed and recreated (not just rotated),
+                 // and if viewmodel survived, it can re-trigger search if results are empty.
+                 // However, viewModel.performSearch is already robust. Let's rely on LiveData.
+            }
+        }
+        // Restore last results if available and not currently loading
+        if (viewModel.isLoading.value == false && !viewModel.searchResults.value.isNullOrEmpty()) {
+             viewModel.restoreLastResults()
+        }
+
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        if (::layoutManager.isInitialized) { // Check if layoutManager has been initialized
+            outState.putParcelable("LAYOUT_MANAGER_STATE", layoutManager.onSaveInstanceState())
+        }
+        outState.putString("CURRENT_QUERY", viewModel.currentQuery)
+    }
+
+
     private fun setupRecyclerView() {
-        searchResultsAdapter = SearchResultsAdapter(this, mutableListOf()) // Pass activity context
+        layoutManager = LinearLayoutManager(this) // Initialize here
+        searchResultsAdapter = SearchResultsAdapter(this, mutableListOf())
         searchResultsRecyclerView.apply {
-            layoutManager = LinearLayoutManager(this@SearchActivity)
+            this.layoutManager = this@SearchActivity.layoutManager // Assign the member variable
             adapter = searchResultsAdapter
         }
     }
 
-    private fun performSearchWithUiUpdate(query: String) {
-        searchProgressBar.visibility = View.VISIBLE
-        searchMessageTextView.visibility = View.GONE
-        searchResultsRecyclerView.visibility = View.GONE
-        searchResultsAdapter.clearData()
-
-        lifecycleScope.launch {
-            val results = performSearch(query)
-            if (results != null) {
-                searchProgressBar.visibility = View.GONE
-                if (results.isNotEmpty()) {
-                    searchResultsAdapter.updateData(results)
-                    searchResultsRecyclerView.visibility = View.VISIBLE
-                } else {
-                    searchMessageTextView.text = getString(R.string.no_results_message)
-                    searchMessageTextView.visibility = View.VISIBLE
+    private fun setupObservers() {
+        viewModel.searchResults.observe(this) { results ->
+            Log.d(TAG, "Observer: searchResults changed, ${results.size} items")
+            searchResultsAdapter.updateData(results)
+            if (results.isNotEmpty()) {
+                searchResultsRecyclerView.visibility = View.VISIBLE
+                searchMessageTextView.visibility = View.GONE
+                layoutManagerState?.let {
+                    layoutManager.onRestoreInstanceState(it)
+                    layoutManagerState = null // Consume state
                 }
-            } else { // Error case
-                searchProgressBar.visibility = View.GONE
-                searchMessageTextView.text = getString(R.string.search_error_message)
+            } else if (viewModel.isLoading.value == false && viewModel.message.value == null) {
+                // If not loading and no specific message, but results are empty (e.g. after a search that yielded nothing)
+                // The message LiveData should handle "no results"
+            }
+        }
+
+        viewModel.isLoading.observe(this) { isLoading ->
+            Log.d(TAG, "Observer: isLoading changed to $isLoading")
+            searchProgressBar.visibility = if (isLoading) View.VISIBLE else View.GONE
+            if (isLoading) {
+                searchResultsRecyclerView.visibility = View.GONE // Hide results while loading new ones
+                searchMessageTextView.visibility = View.GONE // Hide messages while loading
+            }
+        }
+
+        viewModel.message.observe(this) { message ->
+            Log.d(TAG, "Observer: message changed to $message")
+            if (message != null) {
+                searchMessageTextView.text = message
                 searchMessageTextView.visibility = View.VISIBLE
+                searchResultsRecyclerView.visibility = View.GONE // Hide results when a message is shown
+            } else {
+                searchMessageTextView.visibility = View.GONE
             }
         }
     }
 
-    private suspend fun performSearch(query: String): List<SearchResultItem>? {
-        val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        val url = "https://www.gequbao.com/s/$encodedQuery"
-        Log.d(TAG, "Searching URL: $url")
 
-        return withContext(Dispatchers.IO) {
-            try {
-                val doc: Document = Jsoup.connect(url)
-                    .userAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-                    .timeout(10000)
-                    .get()
-                parseSearchResults(doc)
-            } catch (e: Exception) {
-                Log.e(TAG, "Error during search network call or parsing for query: $query", e)
-                null
-            }
-        }
-    }
-
-    private fun parseSearchResults(doc: Document): List<SearchResultItem> {
-        val items = mutableListOf<SearchResultItem>()
-        val elements = doc.select("div.row.list-group-item")
-        Log.d(TAG, "Found ${elements.size} potential result elements.")
-        for (element in elements) {
-            try {
-                val titleElement = element.select("div.col-xs-10.col-md-11 > a.text-primary.lead").first()
-                val title = titleElement?.text()?.trim() ?: ""
-                val artistAlbumElement = element.select("div.col-xs-10.col-md-11 > small.text-muted").first()
-                var artist = artistAlbumElement?.text()?.trim() ?: "Unknown Artist"
-                if (artist.contains(" - ")) {
-                    artist = artist.substringBefore(" - ").trim()
-                }
-                val downloadLinkElement = element.select("div.col-xs-2.col-md-1.text-right > a[href*=/music/]").first()
-                var downloadUrl = downloadLinkElement?.attr("href") ?: ""
-                if (downloadUrl.isNotEmpty() && !downloadUrl.startsWith("http")) {
-                    downloadUrl = "https://www.gequbao.com$downloadUrl"
-                }
-                if (title.isNotEmpty() && downloadUrl.isNotEmpty()) {
-                    Log.d(TAG, "Parsed: Title='$title', Artist='$artist', URL='$downloadUrl'")
-                    items.add(SearchResultItem(title, artist, downloadUrl))
-                } else {
-                    Log.w(TAG, "Skipped item, missing title or URL. Title: '$title', URL: '$downloadUrl'")
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error parsing a single search result item", e)
-            }
-        }
-        if (items.isEmpty() && elements.isNotEmpty()) {
-            Log.w(TAG, "Found result elements but failed to parse any items. Check selectors.")
-        }
-        return items
-    }
-
-    // --- Download Logic ---
+    // --- Download Logic (remains in Activity as it involves system services and UI like Toast/Permissions) ---
     fun initiateDownload(item: SearchResultItem) {
         pendingDownloadItem = item
         if (checkAndRequestStoragePermission()) {
@@ -163,14 +168,12 @@ class SearchActivity : AppCompatActivity() {
     }
 
     private fun checkAndRequestStoragePermission(): Boolean {
-        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) { // P is API 28
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
                 ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE), REQUEST_WRITE_STORAGE_PERMISSION)
                 return false
             }
         }
-        // For API 29+ (Q), DownloadManager saves to app-specific directory in shared storage or public collections
-        // without needing explicit WRITE_EXTERNAL_STORAGE for those specific locations.
         return true
     }
 
@@ -179,9 +182,7 @@ class SearchActivity : AppCompatActivity() {
         if (requestCode == REQUEST_WRITE_STORAGE_PERMISSION) {
             if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                 Log.d(TAG, "WRITE_EXTERNAL_STORAGE permission granted.")
-                pendingDownloadItem?.let {
-                    startDownload(it)
-                }
+                pendingDownloadItem?.let { startDownload(it) }
             } else {
                 Log.d(TAG, "WRITE_EXTERNAL_STORAGE permission denied.")
                 Toast.makeText(this, "Storage permission is required to download songs.", Toast.LENGTH_LONG).show()
@@ -191,28 +192,22 @@ class SearchActivity : AppCompatActivity() {
     }
 
     private fun startDownload(item: SearchResultItem) {
-        if (item.downloadUrl.isEmpty()) {
-            Toast.makeText(this, "Download URL is missing.", Toast.LENGTH_SHORT).show()
+        if (item.downloadUrl.isEmpty() || !item.downloadUrl.startsWith("http")) { // Basic validation
+            Toast.makeText(this, "Invalid download URL: ${item.downloadUrl}", Toast.LENGTH_SHORT).show()
             pendingDownloadItem = null
             return
         }
 
-        // Sanitize title for filename
         val fileName = (item.title.replace(Regex("[^a-zA-Z0-9\\s.-]"), "_") + "_" + (item.artist.replace(Regex("[^a-zA-Z0-9\\s.-]"), "_"))).take(100) + ".mp3"
-
 
         val downloadRequest = DownloadManager.Request(Uri.parse(item.downloadUrl))
         downloadRequest.setTitle(item.title)
-        downloadRequest.setArtist(item.artist) // Set artist metadata if available and supported
+        // downloadRequest.setArtist(item.artist) // Not a standard DownloadManager field
         downloadRequest.setDescription("Downloading ${item.title} - ${item.artist}")
         downloadRequest.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-
-        // Save to public Music directory in a "MusicPlayerApp" subfolder
-        // This works for all API levels, DownloadManager handles appropriate storage.
         downloadRequest.setDestinationInExternalPublicDir(Environment.DIRECTORY_MUSIC, "MusicPlayerApp/" + fileName)
-
-        downloadRequest.setAllowedOverMetered(true) // Allow download over mobile data
-        downloadRequest.setMimeType("audio/mpeg") // Assume mp3
+        downloadRequest.setAllowedOverMetered(true)
+        downloadRequest.setMimeType("audio/mpeg")
 
         val manager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
         try {

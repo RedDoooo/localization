@@ -1,49 +1,35 @@
 package com.example.musicplayerapp
 
 import android.Manifest
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.provider.MediaStore
-import android.Manifest
-import android.content.pm.PackageManager
-import android.media.MediaPlayer
-import android.os.Build
-import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
+import android.os.IBinder
 import android.provider.MediaStore
 import android.util.Log
+import android.widget.Button
 import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.SeekBar
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import java.io.IOException
 import java.util.concurrent.TimeUnit
 
-// Define RepeatMode enum
-enum class RepeatMode {
-    OFF, ONE, ALL
-}
-
-class MainActivity : AppCompatActivity() {
+class MainActivity : AppCompatActivity(), MusicServiceCallback {
 
     private val TAG = "MainActivity"
     private val REQUEST_CODE_READ_STORAGE = 1
 
-    private var musicList: List<Song> = emptyList()
-    private var originalMusicList: List<Song> = emptyList() // For shuffle
-    private var currentSongIndex: Int = -1 // Index in the current list (musicList or a conceptual shuffled view)
-    private var mediaPlayer: MediaPlayer? = null
-    private val handler = Handler(Looper.getMainLooper())
-
-    // Playback state variables
-    private var isShuffleOn: Boolean = false
-    private var repeatMode: RepeatMode = RepeatMode.OFF
-    // private var shuffledIndices: MutableList<Int> = mutableListOf() // Not using this simpler shuffle for now
+    private var musicList: MutableList<Song> = mutableListOf()
+    // Removed: currentSongIndex, mediaPlayer, handler, originalMusicList (partially, service might need original for shuffle off)
+    // Playback state variables like isShuffleOn and repeatMode will be synced from MusicService
 
     // UI Elements
     private lateinit var albumArtImageView: ImageView
@@ -58,14 +44,111 @@ class MainActivity : AppCompatActivity() {
     private lateinit var shuffleButton: ImageButton
     private lateinit var repeatButton: ImageButton
     private lateinit var navigateToSearchButton: Button
-    private lateinit var navigateToLibraryButton: Button // Added for library navigation
+    private lateinit var navigateToLibraryButton: Button
 
+    // MusicService related
+    private var musicService: MusicService? = null
+    private var isServiceBound: Boolean = false
+    private var pendingPlaylist: ArrayList<Song>? = null
+    private var pendingPlaylistIndex: Int = 0
+
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            val binder = service as MusicService.MusicBinder
+            musicService = binder.getService()
+            musicService?.setCallback(this@MainActivity)
+            isServiceBound = true
+            Log.d(TAG, "MusicService connected")
+            syncUiWithServiceState()
+
+            pendingPlaylist?.let { playlist ->
+                Log.d(TAG, "Found pending playlist. Sending to service.")
+                musicService?.setPlaylist(playlist, pendingPlaylistIndex, musicService?.isShuffleEnabled() ?: false, musicService?.getRepeatMode() ?: RepeatMode.OFF)
+                pendingPlaylist = null // Clear after sending
+                pendingPlaylistIndex = 0
+            }
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            Log.d(TAG, "MusicService disconnected")
+            musicService?.setCallback(null) // Important to avoid leaks
+            musicService = null
+            isServiceBound = false
+            // Update UI to reflect service unavailability if needed
+            playPauseButton.setImageResource(android.R.drawable.ic_media_play)
+            songTitleTextView.text = getString(R.string.app_name)
+            artistNameTextView.text = ""
+            playbackSeekBar.progress = 0
+            currentTimeTextView.text = formatDuration(0)
+            totalDurationTextView.text = formatDuration(0)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+        Log.d(TAG, "onCreate")
 
-        // Initialize UI elements
+        initializeUiElements()
+
+        if (checkStoragePermission()) {
+            scanForMusicFiles() // Loads musicList
+        } else {
+            requestStoragePermission()
+        }
+        setupButtonClickListeners()
+        setupSeekBarListener()
+        handleIntent(intent) // Handle intent that might have started the activity
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        Log.d(TAG, "onNewIntent received")
+        intent?.let {
+            handleIntent(it)
+        }
+    }
+
+
+    private fun handleIntent(intent: Intent) {
+        if (intent.action == "PLAY_FROM_LIBRARY" || intent.action == MusicService.ACTION_PLAY_LIST) {
+            val playlist = intent.getParcelableArrayListExtra<Song>(MusicService.EXTRA_SONG_LIST)
+            val startIndex = intent.getIntExtra(MusicService.EXTRA_SONG_INDEX, 0)
+
+            if (playlist != null && playlist.isNotEmpty()) {
+                Log.d(TAG, "Intent to play from library/notification: ${playlist.size} songs, starting at $startIndex")
+                musicList.clear()
+                musicList.addAll(playlist) // Update MainActivity's list as well for consistency
+
+                if (isServiceBound && musicService != null) {
+                    Log.d(TAG, "Service bound, setting playlist directly.")
+                    // Get current shuffle/repeat from service to maintain state unless specified otherwise
+                    val currentShuffle = musicService?.isShuffleEnabled() ?: false
+                    val currentRepeat = musicService?.getRepeatMode() ?: RepeatMode.OFF
+                    musicService?.setPlaylist(playlist, startIndex, currentShuffle, currentRepeat)
+                } else {
+                    Log.d(TAG, "Service not bound, storing playlist as pending.")
+                    pendingPlaylist = playlist
+                    pendingPlaylistIndex = startIndex
+                    // Attempt to bind again if not bound, or wait for onServiceConnected
+                    if (!isServiceBound) {
+                        Intent(this, MusicService::class.java).also { serviceIntent ->
+                            bindService(serviceIntent, serviceConnection, Context.BIND_AUTO_CREATE)
+                            // Consider also starting the service if it might not be running
+                            // ContextCompat.startForegroundService(this, serviceIntent)
+                        }
+                    }
+                }
+            } else {
+                Log.w(TAG, "Intent PLAY_FROM_LIBRARY/ACTION_PLAY_LIST missing playlist or it's empty.")
+            }
+             // Prevent re-processing if activity is recreated without a new intent
+            setIntent(Intent()) // Clear the intent or its action
+        }
+    }
+
+
+    private fun initializeUiElements() {
         albumArtImageView = findViewById(R.id.albumArtImageView)
         songTitleTextView = findViewById(R.id.songTitleTextView)
         artistNameTextView = findViewById(R.id.artistNameTextView)
@@ -78,219 +161,193 @@ class MainActivity : AppCompatActivity() {
         shuffleButton = findViewById(R.id.shuffleButton)
         repeatButton = findViewById(R.id.repeatButton)
         navigateToSearchButton = findViewById(R.id.navigateToSearchButton)
-        navigateToLibraryButton = findViewById(R.id.navigateToLibraryButton) // Initialize library button
+        navigateToLibraryButton = findViewById(R.id.navigateToLibraryButton)
+    }
 
+    private fun syncUiWithServiceState() {
+        if (!isServiceBound || musicService == null) return
+        Log.d(TAG, "Syncing UI with service state")
 
-        if (checkStoragePermission()) {
-            scanForMusicFiles()
-        } else {
-            requestStoragePermission()
+        val currentSong = musicService?.getCurrentSong()
+        onSongChanged(currentSong) // Handles null song
+
+        val isPlaying = musicService?.isPlaying() ?: false
+        val currentPosition = musicService?.getCurrentProgress() ?: 0
+        onPlaybackStateChanged(isPlaying, currentPosition)
+
+        val duration = musicService?.getDuration() ?: 0
+        if (duration > 0) { // Only update if duration is valid
+             onProgressUpdate(currentPosition, duration)
+        } else { // Reset if duration is 0 or invalid
+            playbackSeekBar.max = 100 // Default max
+            playbackSeekBar.progress = 0
+            totalDurationTextView.text = formatDuration(0)
+            currentTimeTextView.text = formatDuration(0)
         }
 
-        setupButtonClickListeners()
-        setupSeekBarListener()
+
+        val shuffleEnabled = musicService?.isShuffleEnabled() ?: false
+        onShuffleModeChanged(shuffleEnabled)
+
+        val currentRepeatMode = musicService?.getRepeatMode() ?: RepeatMode.OFF
+        onRepeatModeChanged(currentRepeatMode)
+    }
+
+
+    override fun onStart() {
+        super.onStart()
+        Log.d(TAG, "onStart - Binding to MusicService")
+        Intent(this, MusicService::class.java).also { intent ->
+            bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+            // If you want the service to start even if not playing, uncomment:
+            // ContextCompat.startForegroundService(this, intent)
+        }
+    }
+
+    override fun onStop() {
+        Log.d(TAG, "onStop")
+        if (isServiceBound) {
+            musicService?.setCallback(null) // Remove callback before unbinding
+            unbindService(serviceConnection)
+            isServiceBound = false
+            Log.d(TAG, "MusicService unbound")
+        }
+        super.onStop()
     }
 
     private fun formatDuration(duration: Long): String {
+        if (duration < 0L) return "0:00"
         val minutes = TimeUnit.MILLISECONDS.toMinutes(duration)
-        val seconds = TimeUnit.MILLISECONDS.toSeconds(duration) -
-                TimeUnit.MINUTES.toSeconds(minutes)
+        val seconds = TimeUnit.MILLISECONDS.toSeconds(duration) - TimeUnit.MINUTES.toSeconds(minutes)
         return String.format("%02d:%02d", minutes, seconds)
     }
 
-    private fun checkStoragePermission(): Boolean {
+    private fun checkStoragePermission(): Boolean { // Keep this for initial scan
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.READ_MEDIA_AUDIO
-            ) == PackageManager.PERMISSION_GRANTED
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED
         } else {
-            ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.READ_EXTERNAL_STORAGE
-            ) == PackageManager.PERMISSION_GRANTED
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
         }
     }
 
-    private fun requestStoragePermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            ActivityCompat.requestPermissions(
-                this,
-                arrayOf(Manifest.permission.READ_MEDIA_AUDIO),
-                REQUEST_CODE_READ_STORAGE
-            )
-        } else {
-            ActivityCompat.requestPermissions(
-                this,
-                arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE),
-                REQUEST_CODE_READ_STORAGE
-            )
-        }
+    private fun requestStoragePermission() { // Keep this for initial scan
+        val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) Manifest.permission.READ_MEDIA_AUDIO else Manifest.permission.READ_EXTERNAL_STORAGE
+        ActivityCompat.requestPermissions(this, arrayOf(permission), REQUEST_CODE_READ_STORAGE)
     }
 
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ) {
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_CODE_READ_STORAGE) {
             if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                Log.d(TAG, "Storage permission granted")
                 scanForMusicFiles()
-                // If music is found, you might want to automatically play the first song
-                // or enable the play button here.
-                if (musicList.isNotEmpty()) {
-                    // Example: playSong(0) // Or just enable UI
-                }
             } else {
-                Log.d(TAG, "Storage permission denied")
-                // Handle permission denial (e.g., show a message to the user, disable music features)
+                Toast.makeText(this, "Storage permission denied. Cannot load local music.", Toast.LENGTH_LONG).show()
+                // Update UI to reflect no music or disabled state for local playback
                 songTitleTextView.text = "Permission Denied"
-                artistNameTextView.text = "Please grant storage access to play music."
-                playPauseButton.isEnabled = false
-                nextButton.isEnabled = false
-                previousButton.isEnabled = false
-                playbackSeekBar.isEnabled = false
+                artistNameTextView.text = "Cannot load local music."
+                playPauseButton.isEnabled = false // Or handle differently
             }
         }
     }
 
-    private fun scanForMusicFiles() {
+    private fun scanForMusicFiles() { // Keep for loading the initial list
         Log.d(TAG, "Scanning for music files...")
-        val tempMusicList = mutableListOf<Song>()
-
-        val projection = arrayOf(
-            MediaStore.Audio.Media._ID,
-            MediaStore.Audio.Media.TITLE,
-            MediaStore.Audio.Media.ARTIST,
-            MediaStore.Audio.Media.ALBUM,
-            MediaStore.Audio.Media.DATA, // File path
-            MediaStore.Audio.Media.DURATION
-        )
-
+        val tempList = mutableListOf<Song>()
+        val projection = arrayOf(MediaStore.Audio.Media._ID, MediaStore.Audio.Media.TITLE, MediaStore.Audio.Media.ARTIST, MediaStore.Audio.Media.ALBUM, MediaStore.Audio.Media.DATA, MediaStore.Audio.Media.DURATION)
         val selection = MediaStore.Audio.Media.IS_MUSIC + " != 0"
-
-        val cursor = contentResolver.query(
-            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
-            projection,
-            selection,
-            null,
-            MediaStore.Audio.Media.DEFAULT_SORT_ORDER
-        )
-
-        cursor?.use { c ->
-            val idColumn = c.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
-            val titleColumn = c.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE)
-            val artistColumn = c.getColumnIndexOrThrow(MediaStore.Audio.Media.ARTIST)
-            val albumColumn = c.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM)
-            val pathColumn = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DATA)
-            val durationColumn = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
-
-            while (c.moveToNext()) {
-                val id = c.getLong(idColumn)
-                val title = c.getString(titleColumn)
-                val artist = c.getString(artistColumn)
-                val album = c.getString(albumColumn)
-                val path = c.getString(pathColumn)
-                val duration = c.getLong(durationColumn)
-
-                val song = Song(id, title, artist, album, path, duration)
-                tempMusicList.add(song)
-                Log.d(TAG, "Found song: ${song.title} by ${song.artist}")
+        contentResolver.query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, projection, selection, null, MediaStore.Audio.Media.DEFAULT_SORT_ORDER)
+            ?.use { cursor ->
+                while (cursor.moveToNext()) {
+                    val id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Audio.Media._ID))
+                    val title = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE))
+                    val artist = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ARTIST))
+                    val album = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM))
+                    val path = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DATA))
+                    val duration = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION))
+                    tempList.add(Song(id, title, artist, album, path, duration))
+                }
             }
-        }
-        musicList = tempMusicList
+        musicList.clear()
+        musicList.addAll(tempList)
+        Log.d(TAG, "Found ${musicList.size} music files.")
         if (musicList.isEmpty()) {
-            Log.d(TAG, "No music files found.")
             songTitleTextView.text = "No Music Found"
-            artistNameTextView.text = "Please add music to your device."
-            playPauseButton.isEnabled = false
-            nextButton.isEnabled = false
-            previousButton.isEnabled = false
-            playbackSeekBar.isEnabled = false
+            artistNameTextView.text = "Add songs to your device or use Search."
+             playPauseButton.isEnabled = false // Only disable if service not playing something else
         } else {
-            Log.d(TAG, "Found ${musicList.size} music files.")
-            // Enable UI elements if they were disabled
-            playPauseButton.isEnabled = true
-            nextButton.isEnabled = true
-            previousButton.isEnabled = true
-            playbackSeekBar.isEnabled = true
-            originalMusicList = ArrayList(musicList) // Store the original order by creating a new list
-            // Optionally, load the first song's details into UI but don't play yet
-            // displaySongDetails(0)
+            playPauseButton.isEnabled = true // Enable play button if local songs found
+            // Optionally, if service not playing, show first song details but don't play
+            if (musicService?.isPlaying() != true && musicService?.getCurrentSong() == null) {
+                 onSongChanged(musicList[0])
+                 onPlaybackStateChanged(false, 0)
+            }
+            updatePlaybackControls(true) // Enable controls as we have music
+        } else {
+            // No music found after scan
+            updatePlaybackControls(false) // Disable controls
+            if (musicService?.isPlaying() != true) { // Only update text if service isn't playing something else
+                songTitleTextView.text = "No Music Found"
+                artistNameTextView.text = "Scan again or download songs."
+            }
         }
     }
 
     private fun setupButtonClickListeners() {
         playPauseButton.setOnClickListener {
-            if (musicList.isEmpty()) return@setOnClickListener
+            if (!isServiceBound) {
+                Toast.makeText(this, "Service not connected", Toast.LENGTH_SHORT).show()
+                // Attempt to bind/start service again if user tries to play
+                Intent(this, MusicService::class.java).also { intent ->
+                    bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+                    // ContextCompat.startForegroundService(this, intent) // If service might not be running
+                }
+                return@setOnClickListener
+            }
+            if (musicList.isEmpty() && musicService?.getCurrentSong() == null) {
+                 Toast.makeText(this, "No music to play. Load songs in library or search.", Toast.LENGTH_SHORT).show()
+                 return@setOnClickListener
+            }
 
-            if (mediaPlayer == null) {
-                currentSongIndex = if (isShuffleOn && musicList.isNotEmpty()) {
-                    (0 until musicList.size).random()
+            if (musicService?.getCurrentSong() == null && musicList.isNotEmpty()) {
+                Log.d(TAG, "Play button: No current song in service, starting with MainActivity list.")
+                val shuffle = musicService?.isShuffleEnabled() ?: false
+                val repeat = musicService?.getRepeatMode() ?: RepeatMode.OFF
+                val startIndex = if (shuffle && musicList.isNotEmpty()) (musicList.indices).random() else 0
+                if (musicList.isNotEmpty()) {
+                    musicService?.setPlaylist(musicList, startIndex, shuffle, repeat)
                 } else {
-                    0
+                     Toast.makeText(this, "Music list is empty.", Toast.LENGTH_SHORT).show()
                 }
-                if(currentSongIndex != -1 && currentSongIndex < musicList.size) { // Ensure valid index before playing
-                    playSong(currentSongIndex)
-                } else if (musicList.isNotEmpty()) { // Fallback if random somehow failed or list became empty
-                    playSong(0)
-                }
-            } else if (mediaPlayer?.isPlaying == true) {
-                mediaPlayer?.pause()
-                playPauseButton.setImageResource(android.R.drawable.ic_media_play)
-                stopSeekBarUpdate()
             } else {
-                mediaPlayer?.start()
-                playPauseButton.setImageResource(android.R.drawable.ic_media_pause)
-                startSeekBarUpdate()
+                musicService?.togglePlayPause()
             }
         }
 
         nextButton.setOnClickListener {
-            playNextSong()
+            if (!isServiceBound) return@setOnClickListener
+            musicService?.skipToNext()
         }
-
         previousButton.setOnClickListener {
-            playPreviousSong()
+            if (!isServiceBound) return@setOnClickListener
+            musicService?.skipToPrevious()
         }
 
         shuffleButton.setOnClickListener {
-            isShuffleOn = !isShuffleOn
-            it.alpha = if (isShuffleOn) 1.0f else 0.5f
-            Log.d("PlaybackControls", "Shuffle mode: $isShuffleOn")
-            if (isShuffleOn) {
-                if (originalMusicList.isEmpty() && musicList.isNotEmpty()) {
-                     originalMusicList = ArrayList(musicList) // Make a copy
-                }
-                Log.d(TAG, "Shuffle ON. Original list size: ${originalMusicList.size}")
-            } else {
-                Log.d(TAG, "Shuffle OFF. Music list size: ${musicList.size}")
-            }
+            if (!isServiceBound) return@setOnClickListener
+            musicService?.toggleShuffle()
         }
 
         repeatButton.setOnClickListener {
-            repeatMode = when (repeatMode) {
-                RepeatMode.OFF -> RepeatMode.ONE
-                RepeatMode.ONE -> RepeatMode.ALL
-                RepeatMode.ALL -> RepeatMode.OFF
-            }
-            when (repeatMode) {
-                RepeatMode.OFF -> { it.alpha = 0.5f; (it as ImageButton).setImageResource(android.R.drawable.ic_menu_revert); Log.d("PlaybackControls", "Repeat: OFF (using revert icon as placeholder for OFF state)") } // Placeholder for OFF
-                RepeatMode.ONE -> { it.alpha = 1.0f; (it as ImageButton).setImageResource(android.R.drawable.ic_popup_sync); Log.d("PlaybackControls", "Repeat: ONE (using sync icon as placeholder)") }
-                RepeatMode.ALL -> { it.alpha = 1.0f; (it as ImageButton).setImageResource(android.R.drawable.ic_menu_rotate); Log.d("PlaybackControls", "Repeat: ALL (using rotate icon as placeholder)") }
-            }
+            if (!isServiceBound) return@setOnClickListener
+            musicService?.toggleRepeatMode()
         }
 
-        navigateToSearchButton.setOnClickListener {
-            val intent = Intent(this, SearchActivity::class.java)
-            startActivity(intent)
-        }
-
+        navigateToSearchButton.setOnClickListener { startActivity(Intent(this, SearchActivity::class.java)) }
         navigateToLibraryButton.setOnClickListener {
-            val intent = Intent(this, LibraryActivity::class.java)
-            startActivity(intent)
+             val intent = Intent(this, LibraryActivity::class.java)
+             // No need to pass data from MainActivity to LibraryActivity directly
+             // LibraryActivity loads its own list.
+             startActivity(intent)
         }
     }
 
@@ -298,250 +355,150 @@ class MainActivity : AppCompatActivity() {
         playbackSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                 if (fromUser) {
-                    // Update current time text view as user scrubs
                     currentTimeTextView.text = formatDuration(progress.toLong())
                 }
             }
-
-            override fun onStartTrackingTouch(seekBar: SeekBar?) {
-                // User started dragging the seek bar
-                if (mediaPlayer?.isPlaying == true) { // Only stop updates if playing
-                    stopSeekBarUpdate()
-                }
-            }
-
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
             override fun onStopTrackingTouch(seekBar: SeekBar?) {
-                seekBar?.let {
-                    mediaPlayer?.seekTo(it.progress)
-                    if (mediaPlayer?.isPlaying == true) { // Only resume updates if it was playing
-                        startSeekBarUpdate()
-                    } else { // If paused, just update current time once
-                        currentTimeTextView.text = formatDuration(it.progress.toLong())
-                    }
-                }
+                seekBar?.let { musicService?.seekToPosition(it.progress) }
             }
         })
     }
 
-    private fun playSong(songIndex: Int) {
-        if (songIndex < 0 || songIndex >= musicList.size) {
-            Log.e(TAG, "Invalid song index: $songIndex or musicList is empty.")
-            return
-        }
-
-        val song = musicList[songIndex]
-
-        try {
-            mediaPlayer?.release() // Release any existing player
-            mediaPlayer = MediaPlayer().apply {
-                setDataSource(song.path)
-                setOnPreparedListener { mp ->
-                    Log.d(TAG, "MediaPlayer prepared for: ${song.title}")
-                    songTitleTextView.text = song.title ?: "Unknown Title"
-                    artistNameTextView.text = song.artist ?: "Unknown Artist"
-                    totalDurationTextView.text = formatDuration(mp.duration.toLong())
-                    playbackSeekBar.max = mp.duration
-                    mp.start()
-                    playPauseButton.setImageResource(android.R.drawable.ic_media_pause)
-                    currentSongIndex = songIndex
-                    startSeekBarUpdate()
-                }
-                setOnCompletionListener {
-                    Log.d(TAG, "Song completed: ${song.title}")
-                    stopSeekBarUpdate() // Stop updates first
-                    if (repeatMode == RepeatMode.ONE) {
-                        mediaPlayer?.seekTo(0)
-                        mediaPlayer?.start()
-                        startSeekBarUpdate() // Restart updates
-                        // Icon should remain pause as it's still playing
-                        playPauseButton.setImageResource(android.R.drawable.ic_media_pause)
-                    } else {
-                        // currentSongIndex might be updated by playNextSong, or it might determine that playback stops.
-                        // Store current state of isPlaying before calling playNextSong
-                        val wasPlayingBeforeNext = mediaPlayer?.isPlaying ?: false
-
-                        playNextSong()
-
-                        // If playNextSong did not result in a new song playing (e.g. end of list and RepeatMode.OFF)
-                        // then we need to set the UI to the stopped/paused state.
-                        if (mediaPlayer?.isPlaying != true) {
-                             playPauseButton.setImageResource(android.R.drawable.ic_media_play)
-                             playbackSeekBar.progress = 0 // Reset seekbar for the stopped song
-                             currentTimeTextView.text = formatDuration(0)
-                             // If the song was playing and now it's not (because playNextSong decided to stop),
-                             // we might also want to update song details to reflect nothing is playing or clear them.
-                             if (wasPlayingBeforeNext) {
-                                 // Optionally clear song title/artist or set to a default "stopped" state
-                                 // songTitleTextView.text = getString(R.string.app_name) // Example
-                                 // artistNameTextView.text = ""
-                             }
-                        }
-                    }
-                }
-                setOnErrorListener { mp, what, extra ->
-                    Log.e(TAG, "MediaPlayer Error: what: $what, extra: $extra for song ${song.title ?: "Unknown"}")
-                    // Handle error, e.g., skip to next song, show error message
-                    playPauseButton.setImageResource(android.R.drawable.ic_media_play)
-                    stopSeekBarUpdate()
-                    true // Error handled
-                }
-                prepareAsync() // Prepare asynchronously
+    // --- MusicServiceCallback Implementation ---
+    override fun onSongChanged(song: Song?) {
+        Log.d(TAG, "Callback: onSongChanged - ${song?.title}")
+        runOnUiThread {
+            if (song != null) {
+                songTitleTextView.text = song.title ?: "Unknown Title"
+                artistNameTextView.text = song.artist ?: "Unknown Artist"
+                // Update album art here if available
+            } else {
+                songTitleTextView.text = getString(R.string.app_name) // Default text
+                artistNameTextView.text = ""
+                // Clear album art
             }
-            Log.d(TAG, "MediaPlayer preparing for: ${song.title}")
-        } catch (e: IOException) {
-            Log.e(TAG, "MediaPlayer IOException for song ${song.path}", e)
-            // Handle error (e.g., show message to user)
-        } catch (e: IllegalStateException) {
-            Log.e(TAG, "MediaPlayer IllegalStateException for song ${song.path ?: "Unknown"}", e)
         }
     }
 
-    private fun playNextSong() {
-        if (musicList.isEmpty()) {
-            Log.d(TAG, "playNextSong: Music list is empty.")
-            playPauseButton.setImageResource(android.R.drawable.ic_media_play) // Ensure UI reflects stopped state
-            stopSeekBarUpdate()
+    override fun onPlaybackStateChanged(isPlaying: Boolean, currentPosition: Int) {
+        Log.d(TAG, "Callback: onPlaybackStateChanged - isPlaying: $isPlaying, Position: $currentPosition")
+        runOnUiThread {
+            playPauseButton.setImageResource(if (isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play)
+            // If playback stops, ensure seekbar reflects this if not already handled by onProgressUpdate
+            if (!isPlaying) {
+                 playbackSeekBar.progress = currentPosition // Sync seekbar to actual position when paused
+                 currentTimeTextView.text = formatDuration(currentPosition.toLong())
+            }
+        }
+    }
+
+    override fun onProgressUpdate(progress: Int, duration: Int) {
+        // Log.d(TAG, "Callback: onProgressUpdate - Progress: $progress, Duration: $duration") // Can be too noisy
+        runOnUiThread {
+            if (duration > 0) { // Avoid division by zero or setting invalid max
+                playbackSeekBar.max = duration
+                totalDurationTextView.text = formatDuration(duration.toLong())
+            } else { // Reset if duration is somehow invalid
+                playbackSeekBar.max = 100
+                totalDurationTextView.text = formatDuration(0)
+            }
+            playbackSeekBar.progress = progress
+            currentTimeTextView.text = formatDuration(progress.toLong())
+        }
+    }
+
+    override fun onShuffleModeChanged(shuffleEnabled: Boolean) {
+        Log.d(TAG, "Callback: onShuffleModeChanged - Enabled: $shuffleEnabled")
+        runOnUiThread {
+            shuffleButton.alpha = if (shuffleEnabled) 1.0f else 0.5f
+        }
+    }
+
+    override fun onRepeatModeChanged(repeatMode: RepeatMode) {
+        Log.d(TAG, "Callback: onRepeatModeChanged - Mode: $repeatMode")
+        runOnUiThread {
+            when (repeatMode) {
+                RepeatMode.OFF -> { repeatButton.alpha = 0.5f; repeatButton.setImageResource(android.R.drawable.ic_menu_revert) } // Placeholder
+                RepeatMode.ONE -> { repeatButton.alpha = 1.0f; repeatButton.setImageResource(android.R.drawable.ic_popup_sync) } // Placeholder
+                RepeatMode.ALL -> { repeatButton.alpha = 1.0f; repeatButton.setImageResource(android.R.drawable.ic_menu_rotate) } // Placeholder
+            }
+        }
+    }
+
+    override fun onPlaylistEnded() {
+        Log.d(TAG, "Callback: onPlaylistEnded")
+        runOnUiThread {
+            Toast.makeText(this, "Playlist ended", Toast.LENGTH_SHORT).show()
+            playPauseButton.setImageResource(android.R.drawable.ic_media_play)
+            // Optionally reset song info display
+            // songTitleTextView.text = getString(R.string.app_name)
+            // artistNameTextView.text = ""
             playbackSeekBar.progress = 0
             currentTimeTextView.text = formatDuration(0)
-            return
-        }
-
-        var nextIndex = -1
-
-        if (isShuffleOn) {
-            if (musicList.size == 1) { // Only one song
-                 // If repeat one is on, onCompletion will handle it. If repeat all, it's like repeat one. If off, it stops.
-                if (repeatMode == RepeatMode.ALL || repeatMode == RepeatMode.ONE) {
-                    nextIndex = currentSongIndex // Replay the same song
-                } else { // RepeatMode.OFF
-                    Log.d(TAG, "playNextSong (Shuffle): Only one song, RepeatMode.OFF. Playback stops.")
-                    playPauseButton.setImageResource(android.R.drawable.ic_media_play)
-                    stopSeekBarUpdate()
-                    // Don't reset currentSongIndex, so if user presses play again, it replays the same song.
-                    return
-                }
-            } else { // More than one song
-                var potentialNextIndex = (0 until musicList.size).random()
-                // Try not to pick the same song immediately unless it's the only option left after several tries (unlikely with large lists)
-                var attempts = 0
-                while (potentialNextIndex == currentSongIndex && attempts < musicList.size / 2) {
-                    potentialNextIndex = (0 until musicList.size).random()
-                    attempts++
-                }
-                nextIndex = potentialNextIndex
-            }
-        } else { // Sequential
-            nextIndex = currentSongIndex + 1
-        }
-
-        // Boundary and RepeatMode.ALL logic
-        if (nextIndex >= musicList.size) {
-            if (repeatMode == RepeatMode.ALL) {
-                nextIndex = 0
-            } else { // RepeatMode.OFF (or RepeatMode.ONE, but that's handled by onCompletion)
-                Log.d(TAG, "playNextSong: End of playlist. RepeatMode: $repeatMode")
-                playPauseButton.setImageResource(android.R.drawable.ic_media_play)
-                stopSeekBarUpdate()
-                // Reset progress for the UI, but keep currentSongIndex at the end.
-                // So if user hits previous, it goes to the last song.
-                playbackSeekBar.progress = 0
-                currentTimeTextView.text = formatDuration(0)
-                // Let onCompletion handle the final UI state if called from there.
-                // If called directly (e.g. user presses next at last song with repeat off), this is the behavior.
-                return
-            }
-        }
-
-        // prevIndex < 0 is not applicable for playNextSong
-
-        if (nextIndex != -1 && nextIndex < musicList.size) { // Ensure nextIndex is valid
-            playSong(nextIndex)
-        } else {
-             Log.d(TAG, "playNextSong: No valid next index determined or playback stopped. Next proposed: $nextIndex, Current: $currentSongIndex, Shuffle: $isShuffleOn, Repeat: $repeatMode")
         }
     }
 
-    private fun playPreviousSong() {
-        if (musicList.isEmpty()) {
-            Log.d(TAG, "playPreviousSong: Music list is empty.")
-            return
-        }
-        var prevIndex = -1
+    override fun onPlaylistChanged(newPlaylist: List<Song>) {
+        Log.d(TAG, "Callback: onPlaylistChanged - New playlist size: ${newPlaylist.size}")
+        // Update MainActivity's list to reflect the service's current playlist
+        this.musicList.clear()
+        this.musicList.addAll(newPlaylist)
 
-        if (isShuffleOn) {
-             if (musicList.size == 1) { // Similar logic to playNextSong for single item list
-                if (repeatMode == RepeatMode.ALL || repeatMode == RepeatMode.ONE) {
-                    prevIndex = currentSongIndex
-                } else {
-                    Log.d(TAG, "playPreviousSong (Shuffle): Only one song, RepeatMode.OFF. No change.")
-                    return
-                }
-            } else { // More than one song
-                var potentialPrevIndex = (0 until musicList.size).random()
-                var attempts = 0
-                while (potentialPrevIndex == currentSongIndex && attempts < musicList.size / 2) {
-                    potentialPrevIndex = (0 until musicList.size).random()
-                    attempts++
-                }
-                prevIndex = potentialPrevIndex
-            }
-        } else { // Sequential
-            prevIndex = currentSongIndex - 1
-        }
-
-        // Boundary and RepeatMode.ALL logic
-        if (prevIndex < 0) {
-            if (repeatMode == RepeatMode.ALL) {
-                prevIndex = musicList.size - 1
-                if (prevIndex < 0) { // Should not happen if musicList is not empty
-                     Log.d(TAG, "playPreviousSong: Music list became empty during wrap around for ALL.")
-                     return
-                }
-            } else { // RepeatMode.OFF or RepeatMode.ONE
-                Log.d(TAG, "playPreviousSong: Start of playlist. RepeatMode: $repeatMode")
-                // Play the first song again or just stay, let's make it play the first song.
-                prevIndex = 0
-            }
-        }
-
-         if (prevIndex != -1 && prevIndex < musicList.size) { // Ensure prevIndex is valid
-            playSong(prevIndex)
-        } else {
-            Log.d(TAG, "playPreviousSong: No valid previous index found. Prev proposed: $prevIndex, Current: $currentSongIndex, Shuffle: $isShuffleOn, Repeat: $repeatMode")
+        // If the playlist became non-empty, ensure controls are enabled.
+        // If it became empty, disable controls (unless service is already stopping).
+        val serviceIsStopping = musicService?.isServiceStopping() ?: true // Assume stopping if service is null
+        if (isServiceBound && !serviceIsStopping) {
+            updatePlaybackControls(newPlaylist.isNotEmpty())
         }
     }
 
-    private val updateSeekBarRunnable = object : Runnable {
-        override fun run() {
-            mediaPlayer?.let {
-                try {
-                    if (it.isPlaying) {
-                        val currentPosition = it.currentPosition
-                        playbackSeekBar.progress = currentPosition
-                        currentTimeTextView.text = formatDuration(currentPosition.toLong())
-                        handler.postDelayed(this, 1000) // Update every second
-                    }
-                } catch (e: IllegalStateException) {
-                    Log.e(TAG, "updateSeekBarRunnable: MediaPlayer released or in invalid state.", e)
-                }
-            }
+    override fun onServiceStopping() {
+        Log.d(TAG, "Callback: onServiceStopping")
+        runOnUiThread {
+            playPauseButton.setImageResource(android.R.drawable.ic_media_play)
+            updatePlaybackControls(false)
+            // Optionally reset song info text
+            // songTitleTextView.text = getString(R.string.app_name)
+            // artistNameTextView.text = ""
         }
     }
 
-    private fun startSeekBarUpdate() {
-        // Remove any existing callbacks to prevent multiple updates
-        handler.removeCallbacks(updateSeekBarRunnable)
-        handler.post(updateSeekBarRunnable)
+    override fun onPlaybackError(errorMsg: String) {
+        Log.e(TAG, "Callback: onPlaybackError - $errorMsg")
+        runOnUiThread {
+            Toast.makeText(this, "Playback Error: $errorMsg", Toast.LENGTH_LONG).show()
+            // Update UI to a stopped state
+            playPauseButton.setImageResource(android.R.drawable.ic_media_play)
+            songTitleTextView.text = "Error"
+            artistNameTextView.text = "Playback failed"
+            playbackSeekBar.progress = 0
+            currentTimeTextView.text = formatDuration(0)
+            // Consider disabling controls until a new song is selected or list reloaded
+            updatePlaybackControls(musicList.isNotEmpty())
+        }
     }
 
-    private fun stopSeekBarUpdate() {
-        handler.removeCallbacks(updateSeekBarRunnable)
+
+    private fun updatePlaybackControls(enabled: Boolean) {
+        Log.d(TAG, "Updating playback controls enabled: $enabled")
+        playPauseButton.isEnabled = enabled
+        nextButton.isEnabled = enabled
+        previousButton.isEnabled = enabled
+        playbackSeekBar.isEnabled = enabled
+        // shuffleButton.isEnabled = enabled // Shuffle/repeat can be always enabled or tied to playlist presence
+        // repeatButton.isEnabled = enabled
     }
+
 
     override fun onDestroy() {
+        Log.d(TAG, "onDestroy")
+        // Service unbinding is handled in onStop, but as a safeguard:
+        if (isServiceBound) {
+            musicService?.setCallback(null)
+            unbindService(serviceConnection)
+            isServiceBound = false
+        }
         super.onDestroy()
-        mediaPlayer?.release()
-        mediaPlayer = null
-        stopSeekBarUpdate()
     }
 }

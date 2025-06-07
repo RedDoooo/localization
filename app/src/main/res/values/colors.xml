@@ -13,4 +13,8 @@
     <color name="colorAccent">#03DAC5</color>
     <color name="textColorPrimary">#FFFFFF</color>
     <color name="textColorSecondary">#B3FFFFFF</color>
+
+    <!-- For selected items -->
+    <color name="selected_item_background">#E0E0E0</color> <!-- Light gray -->
+    <color name="default_item_background">@android:color/transparent</color>
 </resources>
