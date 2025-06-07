@@ -1,0 +1,14 @@
+<resources>
+    <string name="app_name">MusicPlayerApp</string>
+    <string name="song_title_placeholder">Song Title</string>
+    <string name="artist_name_placeholder">Artist Name</string>
+    <string name="time_placeholder">0:00</string>
+
+    <!-- Search Activity Strings -->
+    <string name="search_hint">Search songs, artists...</string>
+    <string name="search_button_text">Search</string>
+    <string name="no_results_message">No songs found.</string>
+    <string name="search_error_message">Error searching. Please try again.</string>
+    <string name="search_activity_title">Search Online</string>
+    <string name="library_activity_title">My Music Library</string>
+</resources>
